@@ -1,10 +1,9 @@
-package main
+package docker_image_history
 
 import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
-	"flag"
 	"fmt"
 	"io"
 	"log"
@@ -24,71 +23,9 @@ import (
 	"k8s.io/client-go/util/homedir"
 )
 
-// Config stores the Docker & K8s clients as well as the results from searching for keywords in image history
-type Config struct {
-	dockerImageKeyWords         []string
-	dockerImages                map[string][]podDetails
-	offendingDockerImages       []offendingDockerImage
-	dockerClient                *dockerClient.Client
-	ecrCredentials              map[string]string
-	k8sClient                   *kubernetes.Clientset
-	clusterK8sContextName       string
-	imagesAccountAWSProfileName string
-}
-
-// podDetails provides K8s context for any images which have been matched in the cluster
-type podDetails struct {
-	podName       string
-	containerName string
-	namespace     string
-}
-
-// offendingDockerImage stores a result of an image which has been matched against the target keywords
-type offendingDockerImage struct {
-	matchFound      bool
-	imageRef        string
-	matchedKeywords map[string]int
-}
-
-// Event stores the data parsed from each Docker image pull log
-type Event struct {
-	Status         string `json:"status"`
-	Error          string `json:"error"`
-	Progress       string `json:"progress"`
-	ProgressDetail struct {
-		Current int `json:"current"`
-		Total   int `json:"total"`
-	} `json:"progressDetail"`
-}
-
-var (
-	clusterK8sContextName       string
-	imagesAccountAWSProfileName string
-	dockerImageKeyWordsFlag     string
-	dockerImageKeyWords         []string
-	ecrRegions                  = []string{"eu-west-1", "ap-southeast-2"} // AWS regions that the Docker images are present in
-)
-
-func main() {
-	parseFlags()
-	log.Printf("Using K8s Context: %s", clusterK8sContextName)
-	log.Printf("Using AWS Profile: %s", imagesAccountAWSProfileName)
-	log.Printf("Searching for these keywords in image history of all pods in cluster: %v", dockerImageKeyWords)
-
-	cfg, err := NewConfig(dockerImageKeyWords, clusterK8sContextName, imagesAccountAWSProfileName)
-	defer func(dockerClient *dockerClient.Client) {
-		err := dockerClient.Close()
-		if err != nil {
-			log.Printf("closing Docker client: %s", err)
-		}
-	}(cfg.dockerClient)
-	if err != nil {
-		log.Fatalf("loading config: %s", err)
-	}
-
-	if err = cfg.ProcessAllImagesHistoryForKeywords(); err != nil {
-		log.Fatalln(err)
-	}
+var AllAWSRegions = []string{"af-south-1", "ap-south-1", "eu-north-1", "eu-west-3", "eu-west-2", "eu-west-1", "ap-northeast-3", "ap-northeast-2",
+	"ap-northeast-1", "ca-central-1", "sa-east-1", "ap-southeast-1", "ap-southeast-2", "eu-central-1", "us-east-1", "us-east-2", "us-west-1",
+	"us-west-2",
 }
 
 // ProcessAllImagesHistoryForKeywords queries all images of containers running in the cluster and checks their history to see if it matches 1 or more keywords
@@ -96,6 +33,14 @@ func main() {
 // 1) Images which have a history containing at least 1 keyword
 // 2) Images which are not stored in an AWS ECR registry
 func (c *Config) ProcessAllImagesHistoryForKeywords() error {
+
+	defer func(dockerClient *dockerClient.Client) {
+		err := dockerClient.Close()
+		if err != nil {
+			log.Printf("closing Docker client: %s", err)
+		}
+	}(c.dockerClient)
+
 	if err := c.queryAllContainerImageRefsInCluster(); err != nil {
 		return err
 	}
@@ -137,23 +82,8 @@ func (c *Config) ProcessAllImagesHistoryForKeywords() error {
 	return nil
 }
 
-// parseFlags parses the CLI flags passed
-func parseFlags() {
-	flag.StringVar(&clusterK8sContextName, "clusterK8sContextName", "", "Context to use in K8s config file in ${HOME}/.kube/config")
-	flag.StringVar(&imagesAccountAWSProfileName, "imagesAccountAWSProfileName", "", "AWS profile name to use to authenticate for pulling ECR based Docker images")
-	flag.StringVar(&dockerImageKeyWordsFlag, "dockerImageKeyWords", "", "Comma separated list of keywords to search for in image history of K8s pods running in the cluster")
-	flag.Parse()
-
-	if len(dockerImageKeyWordsFlag) > 0 {
-		dockerImageKeyWords = strings.Split(dockerImageKeyWordsFlag, ",")
-	}
-	if len(clusterK8sContextName) == 0 || len(imagesAccountAWSProfileName) == 0 || len(dockerImageKeyWords) == 0 {
-		log.Fatalln("Usage: query-k8s-container-image-history -clusterK8sContextName=<context> -imagesAccountAWSProfileName=<profile> -dockerImageKeyWords='keyword1,keyword2'")
-	}
-}
-
 // NewConfig returns a new Config with initialised Docker & K8s clients
-func NewConfig(keywords []string, clusterAccountProfile, imagesAccountProfile string) (*Config, error) {
+func NewConfig(keywords []string, clusterAccountProfile, imagesAccountProfile string, ecrRegions []string) (*Config, error) {
 	cfg := &Config{}
 
 	cfg.imagesAccountAWSProfileName = imagesAccountProfile
@@ -162,9 +92,10 @@ func NewConfig(keywords []string, clusterAccountProfile, imagesAccountProfile st
 	cfg.dockerImages = make(map[string][]podDetails)
 	cfg.offendingDockerImages = make([]offendingDockerImage, 0)
 	cfg.ecrCredentials = make(map[string]string)
+	cfg.ecrRegions = ecrRegions
 
 	// Get Docker login credentials via ECR API for each AWS region images are present in
-	for _, region := range ecrRegions {
+	for _, region := range cfg.ecrRegions {
 		awsConfig, err := config.LoadDefaultConfig(context.Background(), config.WithSharedConfigProfile(imagesAccountProfile), config.WithRegion(region))
 		if err != nil {
 			return nil, fmt.Errorf("loading AWS config: %s", err)
@@ -223,15 +154,15 @@ func (c *Config) outputNonECRImages() error {
 	nonECRImageResultsPath := fmt.Sprintf("non-ecr-images-%s-%s.txt", c.clusterK8sContextName, time.Now().Format("2-Jan-2006-15:04"))
 
 	f, err := os.OpenFile(nonECRImageResultsPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+	if err != nil {
+		return fmt.Errorf("opening file '%s': %s", nonECRImageResultsPath, err)
+	}
 	defer func(f *os.File) {
 		err := f.Close()
 		if err != nil {
 			log.Printf("problem closing file '%s': %s", nonECRImageResultsPath, err)
 		}
 	}(f)
-	if err != nil {
-		return fmt.Errorf("opening file '%s': %s", nonECRImageResultsPath, err)
-	}
 
 	for image, details := range c.dockerImages {
 		if !strings.Contains(image, "amazonaws.com") {
@@ -257,15 +188,15 @@ func (c *Config) outputOffendingImages() error {
 
 	if len(c.offendingDockerImages) > 0 {
 		f, err := os.OpenFile(offendingImageResultsPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+		if err != nil {
+			return fmt.Errorf("opening file '%s': %s", offendingImageResultsPath, err)
+		}
 		defer func(f *os.File) {
 			err := f.Close()
 			if err != nil {
 				log.Printf("problem closing file '%s': %s", offendingImageResultsPath, err)
 			}
 		}(f)
-		if err != nil {
-			return fmt.Errorf("opening file '%s': %s", offendingImageResultsPath, err)
-		}
 
 		for _, i := range c.offendingDockerImages {
 			details := c.dockerImages[i.imageRef]
@@ -310,6 +241,8 @@ func (c *Config) queryAllContainerImageRefsInCluster() error {
 	return nil
 }
 
+// checkImageHistoryForKeyWords checks the history single Docker image for a set of keywords
+// Returns offendingDockerImage which includes whether a match has been found, and details of the matches if so
 func (c *Config) checkImageHistoryForKeyWords(imageRef string) (offendingDockerImage, error) {
 	var result offendingDockerImage
 	result.matchedKeywords = make(map[string]int)
@@ -339,14 +272,14 @@ func (c *Config) pullImage(imageReference string) error {
 
 	if strings.Contains(imageReference, "amazonaws.com") {
 		foundRegion := false
-		for _, region := range ecrRegions {
+		for _, region := range c.ecrRegions {
 			if strings.Contains(imageReference, fmt.Sprintf("dkr.ecr.%s.amazonaws.com", region)) {
 				pullOptions.RegistryAuth = c.ecrCredentials[region]
 				foundRegion = true
 			}
 		}
 		if !foundRegion {
-			return fmt.Errorf("unsupported ECR image region detected. Currently supported: %v", ecrRegions)
+			return fmt.Errorf("unsupported ECR image region detected. Currently supported: %v", c.ecrRegions)
 		}
 	}
 
@@ -383,4 +316,25 @@ func (c *Config) cleanupImage(imageReference string) error {
 		return fmt.Errorf("cleaning up local image '%s': %s", imageReference, err)
 	}
 	return nil
+}
+
+// ValidateAWSRegions validates whether all the regions are valid AWS region codes
+func ValidateAWSRegions(regions []string) bool {
+	for _, r := range regions {
+		if !sliceContains(AllAWSRegions, r) {
+			return false
+		}
+	}
+	return true
+}
+
+// sliceContains returns whether s is in the string slice
+func sliceContains(slice []string, s string) bool {
+	found := false
+	for _, e := range slice {
+		if e == s {
+			found = true
+		}
+	}
+	return found
 }
