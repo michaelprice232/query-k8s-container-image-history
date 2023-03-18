@@ -32,5 +32,5 @@ Performs the following tasks:
 ## Running
 ```shell
 # Ensure pre-req's are met above. ecrRegions is optional and required only if you have private ECR based images
-% go run main.go --clusterK8sContextName "prod-cluster" --imagesAccountAWSProfileName "production" --dockerImageKeyWords "openjdk-8,openjdk8,jdk-14,jdk14" --ecrRegions "eu-west-1,eu-west-2"
+% go run ./cmd/main.go --clusterK8sContextName "prod-cluster" --imagesAccountAWSProfileName "production" --dockerImageKeyWords "openjdk-8,openjdk8,jdk-14,jdk14" --ecrRegions "eu-west-1,eu-west-2"
 ```
